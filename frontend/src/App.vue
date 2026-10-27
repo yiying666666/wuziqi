@@ -162,9 +162,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import GomokuBoard from "./components/GomokuBoard.vue";
 import { useSession } from "./composables/useSession";
-import { authApi, profileApi } from "./services/api";
+import { aiApi, authApi, profileApi } from "./services/api";
 import { SocketClient } from "./services/socket";
-import type { Profile, RoomState, StoneColor } from "./types";
+import type { AIDifficulty, Profile, RoomState, StoneColor } from "./types";
 
 const BOARD_SIZE = 15;
 const BLACK_STONE: StoneColor = 1;
@@ -189,8 +189,6 @@ interface PveGameState {
 
 type ResultTone = "win" | "lose" | "draw";
 type ResultMode = "online" | "ai";
-type AIDifficulty = "easy" | "medium" | "hard";
-
 interface ResultDialogState {
   visible: boolean;
   mode: ResultMode;
@@ -199,20 +197,17 @@ interface ResultDialogState {
   message: string;
 }
 
-interface CandidateMove {
-  x: number;
-  y: number;
-  score: number;
-}
-
 const AI_DIFFICULTY_OPTIONS: Array<{ value: AIDifficulty; label: string; desc: string }> = [
   { value: "easy", label: "简单", desc: "偏随机，适合新手" },
   { value: "medium", label: "普通", desc: "稳健攻防，推荐" },
   { value: "hard", label: "困难", desc: "带搜索，更强" },
 ];
 
-const HARD_SEARCH_DEPTH = 3;
-const HARD_BRANCHING = 6;
+const AI_THINK_MS_BY_DIFFICULTY: Record<AIDifficulty, number> = {
+  easy: 360,
+  medium: 900,
+  hard: 1800,
+};
 
 const createEmptyBoard = (): number[][] =>
   Array.from({ length: BOARD_SIZE }, () => Array.from({ length: BOARD_SIZE }, () => 0));
@@ -239,19 +234,6 @@ const countDirection = (
   return count;
 };
 
-const isOpenEnd = (
-  board: number[][],
-  x: number,
-  y: number,
-  dx: number,
-  dy: number,
-  length: number,
-): boolean => {
-  const nx = x + dx * (length + 1);
-  const ny = y + dy * (length + 1);
-  return inBounds(nx, ny) && board[ny][nx] === 0;
-};
-
 const checkWinAt = (board: number[][], x: number, y: number, color: number): boolean =>
   DIRECTIONS.some(([dx, dy]) => {
     const forward = countDirection(board, x, y, dx, dy, color);
@@ -261,247 +243,6 @@ const checkWinAt = (board: number[][], x: number, y: number, color: number): boo
 
 const isBoardFull = (board: number[][]): boolean =>
   board.every((row) => row.every((cell) => cell !== 0));
-
-const wouldWin = (board: number[][], x: number, y: number, color: number): boolean => {
-  if (board[y][x] !== 0) return false;
-  board[y][x] = color;
-  const won = checkWinAt(board, x, y, color);
-  board[y][x] = 0;
-  return won;
-};
-
-const collectCandidates = (board: number[][]): Array<{ x: number; y: number }> => {
-  const candidates = new Set<string>();
-  let hasStone = false;
-
-  for (let y = 0; y < BOARD_SIZE; y += 1) {
-    for (let x = 0; x < BOARD_SIZE; x += 1) {
-      if (board[y][x] === 0) continue;
-      hasStone = true;
-      for (let dy = -2; dy <= 2; dy += 1) {
-        for (let dx = -2; dx <= 2; dx += 1) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (!inBounds(nx, ny) || board[ny][nx] !== 0) continue;
-          candidates.add(`${nx},${ny}`);
-        }
-      }
-    }
-  }
-
-  if (!hasStone) {
-    const center = Math.floor(BOARD_SIZE / 2);
-    return [{ x: center, y: center }];
-  }
-
-  return [...candidates].map((item) => {
-    const [x, y] = item.split(",").map(Number);
-    return { x, y };
-  });
-};
-
-const evaluatePoint = (board: number[][], x: number, y: number, color: number): number => {
-  let score = 0;
-
-  for (const [dx, dy] of DIRECTIONS) {
-    const left = countDirection(board, x, y, -dx, -dy, color);
-    const right = countDirection(board, x, y, dx, dy, color);
-    const total = 1 + left + right;
-    const openEnds = Number(isOpenEnd(board, x, y, -dx, -dy, left)) + Number(isOpenEnd(board, x, y, dx, dy, right));
-
-    if (total >= 5) {
-      score += 120000;
-    } else if (total === 4 && openEnds === 2) {
-      score += 28000;
-    } else if (total === 4 && openEnds === 1) {
-      score += 9000;
-    } else if (total === 3 && openEnds === 2) {
-      score += 2600;
-    } else if (total === 3 && openEnds === 1) {
-      score += 900;
-    } else if (total === 2 && openEnds === 2) {
-      score += 350;
-    } else if (total === 2 && openEnds === 1) {
-      score += 110;
-    } else if (total === 1 && openEnds === 2) {
-      score += 22;
-    }
-  }
-
-  const center = Math.floor(BOARD_SIZE / 2);
-  const distance = Math.abs(x - center) + Math.abs(y - center);
-  score += (BOARD_SIZE - distance) * 4;
-
-  return score;
-};
-
-const oppositeColor = (color: StoneColor): StoneColor => (color === BLACK_STONE ? WHITE_STONE : BLACK_STONE);
-
-const rankCandidateMoves = (
-  board: number[][],
-  selfColor: StoneColor,
-  otherColor: StoneColor,
-): CandidateMove[] => {
-  const candidates = collectCandidates(board);
-  return candidates
-    .map((point) => {
-      board[point.y][point.x] = selfColor;
-      const attack = evaluatePoint(board, point.x, point.y, selfColor);
-      board[point.y][point.x] = otherColor;
-      const defend = evaluatePoint(board, point.x, point.y, otherColor);
-      board[point.y][point.x] = 0;
-
-      return {
-        x: point.x,
-        y: point.y,
-        score: attack * 1.15 + defend,
-      };
-    })
-    .sort((a, b) => b.score - a.score);
-};
-
-const findImmediateWin = (board: number[][], color: StoneColor): { x: number; y: number } | null => {
-  const candidates = collectCandidates(board);
-  for (const point of candidates) {
-    if (wouldWin(board, point.x, point.y, color)) {
-      return point;
-    }
-  }
-  return null;
-};
-
-const evaluateBoardState = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): number => {
-  const rankedForAI = rankCandidateMoves(board, aiColor, humanColor);
-  const rankedForHuman = rankCandidateMoves(board, humanColor, aiColor);
-
-  const aiBest = rankedForAI[0]?.score ?? 0;
-  const aiSecond = rankedForAI[1]?.score ?? 0;
-  const humanBest = rankedForHuman[0]?.score ?? 0;
-  const humanSecond = rankedForHuman[1]?.score ?? 0;
-
-  return aiBest * 1.1 + aiSecond * 0.45 - (humanBest * 1.2 + humanSecond * 0.55);
-};
-
-const negamax = (
-  board: number[][],
-  depth: number,
-  currentColor: StoneColor,
-  aiColor: StoneColor,
-  alpha: number,
-  beta: number,
-): number => {
-  const humanColor = oppositeColor(aiColor);
-  if (depth === 0 || isBoardFull(board)) {
-    const evalScore = evaluateBoardState(board, aiColor, humanColor);
-    return currentColor === aiColor ? evalScore : -evalScore;
-  }
-
-  const rankedMoves = rankCandidateMoves(board, currentColor, oppositeColor(currentColor)).slice(0, HARD_BRANCHING);
-  if (!rankedMoves.length) {
-    const evalScore = evaluateBoardState(board, aiColor, humanColor);
-    return currentColor === aiColor ? evalScore : -evalScore;
-  }
-
-  let best = Number.NEGATIVE_INFINITY;
-  let localAlpha = alpha;
-
-  for (const move of rankedMoves) {
-    board[move.y][move.x] = currentColor;
-
-    const score = checkWinAt(board, move.x, move.y, currentColor)
-      ? 900000 + depth * 1000
-      : -negamax(board, depth - 1, oppositeColor(currentColor), aiColor, -beta, -localAlpha);
-
-    board[move.y][move.x] = 0;
-
-    if (score > best) {
-      best = score;
-    }
-    if (best > localAlpha) {
-      localAlpha = best;
-    }
-    if (localAlpha >= beta) {
-      break;
-    }
-  }
-
-  return best;
-};
-
-const pickEasyAIMove = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): { x: number; y: number } | null => {
-  const winNow = findImmediateWin(board, aiColor);
-  if (winNow) return winNow;
-
-  const mustBlock = findImmediateWin(board, humanColor);
-  if (mustBlock && Math.random() < 0.75) {
-    return mustBlock;
-  }
-
-  const ranked = rankCandidateMoves(board, aiColor, humanColor);
-  if (!ranked.length) return null;
-  const choicePool = ranked.slice(0, Math.min(6, ranked.length));
-  const pick = choicePool[Math.floor(Math.random() * choicePool.length)];
-  return { x: pick.x, y: pick.y };
-};
-
-const pickMediumAIMove = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): { x: number; y: number } | null => {
-  const winNow = findImmediateWin(board, aiColor);
-  if (winNow) return winNow;
-
-  const mustBlock = findImmediateWin(board, humanColor);
-  if (mustBlock) return mustBlock;
-
-  const ranked = rankCandidateMoves(board, aiColor, humanColor);
-  if (!ranked.length) return null;
-  const topScore = ranked[0].score;
-  const bestPoints = ranked.filter((move) => move.score === topScore);
-  const pick = bestPoints[Math.floor(Math.random() * bestPoints.length)] ?? ranked[0];
-  return { x: pick.x, y: pick.y };
-};
-
-const pickHardAIMove = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): { x: number; y: number } | null => {
-  const winNow = findImmediateWin(board, aiColor);
-  if (winNow) return winNow;
-
-  const mustBlock = findImmediateWin(board, humanColor);
-  if (mustBlock) return mustBlock;
-
-  const rootCandidates = rankCandidateMoves(board, aiColor, humanColor).slice(0, HARD_BRANCHING + 1);
-  if (!rootCandidates.length) return null;
-
-  let bestMove = rootCandidates[0];
-  let bestScore = Number.NEGATIVE_INFINITY;
-
-  for (const move of rootCandidates) {
-    board[move.y][move.x] = aiColor;
-    const score = checkWinAt(board, move.x, move.y, aiColor)
-      ? 1_000_000
-      : -negamax(board, HARD_SEARCH_DEPTH - 1, humanColor, aiColor, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
-    board[move.y][move.x] = 0;
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestMove = move;
-    }
-  }
-
-  return { x: bestMove.x, y: bestMove.y };
-};
-
-const pickBestAIMove = (
-  board: number[][],
-  aiColor: StoneColor,
-  humanColor: StoneColor,
-  difficulty: AIDifficulty,
-): { x: number; y: number } | null => {
-  if (difficulty === "easy") {
-    return pickEasyAIMove(board, aiColor, humanColor);
-  }
-  if (difficulty === "hard") {
-    return pickHardAIMove(board, aiColor, humanColor);
-  }
-  return pickMediumAIMove(board, aiColor, humanColor);
-};
 
 const session = useSession();
 const socket = new SocketClient();
@@ -717,7 +458,7 @@ const startAiGame = (): void => {
   notice.value = `已开始人机对战（${aiDifficultyText.value}）：本局白棋先行（AI 先手）`;
   clearAiTimer();
   aiTimer = setTimeout(() => {
-    makeAiMove();
+    void makeAiMove();
   }, 420);
 };
 
@@ -741,34 +482,65 @@ const finishAiGame = (winnerColor: StoneColor | null, reason: "normal" | "draw")
   openResultDialog("ai", "lose", "很遗憾你输了", "是否立即开启下一局再挑战 AI？");
 };
 
-const makeAiMove = (): void => {
+const makeAiMove = async (): Promise<void> => {
   if (!aiGame.value || aiGame.value.status !== "in_progress" || aiGame.value.currentTurn !== AI_COLOR) {
     return;
   }
 
-  const board = aiGame.value.board;
-  const point = pickBestAIMove(board, AI_COLOR, HUMAN_COLOR, aiDifficulty.value);
-  if (!point) {
-    finishAiGame(null, "draw");
+  const token = session.state.token;
+  if (!token) {
+    errorMessage.value = "登录状态已失效，请重新登录后继续人机对战";
     return;
   }
 
-  board[point.y][point.x] = AI_COLOR;
+  const boardSnapshot = aiGame.value.board.map((row) => [...row]);
 
-  if (checkWinAt(board, point.x, point.y, AI_COLOR)) {
-    finishAiGame(AI_COLOR, "normal");
-    notice.value = "AI 获胜，本局结束。";
-    return;
+  try {
+    const response = await aiApi.nextMove(
+      {
+        board: boardSnapshot,
+        aiColor: AI_COLOR,
+        humanColor: HUMAN_COLOR,
+        difficulty: aiDifficulty.value,
+        maxThinkMs: AI_THINK_MS_BY_DIFFICULTY[aiDifficulty.value],
+      },
+      token,
+    );
+
+    if (!aiGame.value || aiGame.value.status !== "in_progress" || aiGame.value.currentTurn !== AI_COLOR) {
+      return;
+    }
+
+    if (response.x === null || response.y === null) {
+      finishAiGame(null, "draw");
+      notice.value = "平局，棋盘已满。";
+      return;
+    }
+
+    if (!inBounds(response.x, response.y) || aiGame.value.board[response.y][response.x] !== 0) {
+      throw new Error("后端返回了非法落子坐标");
+    }
+
+    aiGame.value.board[response.y][response.x] = AI_COLOR;
+
+    if (checkWinAt(aiGame.value.board, response.x, response.y, AI_COLOR)) {
+      finishAiGame(AI_COLOR, "normal");
+      notice.value = "AI 获胜，本局结束。";
+      return;
+    }
+
+    if (isBoardFull(aiGame.value.board)) {
+      finishAiGame(null, "draw");
+      notice.value = "平局，棋盘已满。";
+      return;
+    }
+
+    aiGame.value.currentTurn = HUMAN_COLOR;
+    notice.value = "轮到你落子";
+  } catch (error) {
+    errorMessage.value = `AI 落子失败：${(error as Error).message}`;
+    notice.value = "请检查后端 AI 服务是否可用，然后重试。";
   }
-
-  if (isBoardFull(board)) {
-    finishAiGame(null, "draw");
-    notice.value = "平局，棋盘已满。";
-    return;
-  }
-
-  aiGame.value.currentTurn = HUMAN_COLOR;
-  notice.value = "轮到你落子";
 };
 
 const placeStone = (x: number, y: number): void => {
@@ -805,7 +577,7 @@ const placeStone = (x: number, y: number): void => {
     notice.value = "AI 思考中...";
     clearAiTimer();
     aiTimer = setTimeout(() => {
-      makeAiMove();
+      void makeAiMove();
     }, 420);
     return;
   }

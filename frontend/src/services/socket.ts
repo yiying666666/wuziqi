@@ -2,7 +2,7 @@ import type { WsPacket } from "../types";
 
 type EventHandler = (payload: unknown) => void;
 
-const WS_BASE = import.meta.env.VITE_WS_BASE ?? "ws://localhost:3000/ws";
+const WS_BASE = import.meta.env.VITE_WS_BASE ?? `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws`;
 
 export class SocketClient {
   private ws: WebSocket | null = null;

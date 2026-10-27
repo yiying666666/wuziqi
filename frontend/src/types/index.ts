@@ -1,4 +1,5 @@
 export type StoneColor = 1 | 2;
+export type AIDifficulty = "easy" | "medium" | "hard";
 
 export interface User {
   id: number;
@@ -50,6 +51,25 @@ export interface RoomState {
   gameId?: number;
   startedAt?: string;
   endedAt?: string;
+}
+
+export interface AiMoveRequest {
+  board: number[][];
+  aiColor: StoneColor;
+  humanColor: StoneColor;
+  difficulty: AIDifficulty;
+  maxThinkMs?: number;
+}
+
+export interface AiMoveResponse {
+  x: number | null;
+  y: number | null;
+  color: StoneColor;
+  difficulty: AIDifficulty;
+  searchedDepth: number;
+  candidateCount: number;
+  elapsedMs: number;
+  reason: string;
 }
 
 export interface WsPacket<T = unknown> {

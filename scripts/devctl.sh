@@ -213,7 +213,7 @@ start_backend() {
     # shellcheck disable=SC1091
     source .env
     set +a
-    export CORS_ORIGIN="http://${LAN_IP_VALUE}:5173"
+    export CORS_ORIGIN="http://${LAN_IP_VALUE}:5173,http://127.0.0.1:5173,http://localhost:5173"
     export REDIS_ENABLED=true
     nohup java -jar "$BACKEND_JAR" >"$BACKEND_LOG" 2>&1 &
     echo $! >"$BACKEND_PID_FILE"
