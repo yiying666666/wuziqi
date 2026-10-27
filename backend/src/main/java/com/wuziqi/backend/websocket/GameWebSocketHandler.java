@@ -128,6 +128,10 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
                     handleJoinRoom(user, code);
                 }
                 case "room:leave" -> handleLeaveRoom(user);
+                case "room:restart" -> {
+                    String roomCode = payload.path("roomCode").asText("").toUpperCase(Locale.ROOT);
+                    handleRestartRoom(user, roomCode);
+                }
                 case "game:move" -> {
                     String roomCode = payload.path("roomCode").asText("").toUpperCase(Locale.ROOT);
                     int x = payload.path("x").asInt(-1);
@@ -204,8 +208,13 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
             user.roomCode = room.getCode();
             roomCacheService.saveUserRoom(user.userId, room.getCode());
             clearReconnectTimer(room.getCode(), user.userId);
-            persistRoom(room);
-            broadcastRoomState(room);
+
+            boolean started = startWaitingRoomIfReady(room);
+            if (!started) {
+                persistRoom(room);
+                broadcastRoomState(room);
+            }
+
             broadcast(room, "player:reconnected", Map.of(
                     "userId", user.userId,
                     "username", user.username
@@ -225,6 +234,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         player.setConnected(true);
 
         room.getPlayers().add(player);
+        prepareNextRoundStarter(room);
         room.setStatus(RoomStatus.in_progress);
         room.setStartedAt(Instant.now());
 
@@ -288,6 +298,125 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
             ));
             broadcastRoomState(room);
         }
+    }
+
+    private synchronized void handleRestartRoom(SessionUser user, String roomCode) {
+        String code = roomCode == null || roomCode.isBlank() ? user.roomCode : roomCode;
+        if (code == null || code.isBlank()) {
+            emitError(user.userId, "Missing room code");
+            return;
+        }
+
+        RoomState room = getRoom(code);
+        if (room == null) {
+            emitError(user.userId, "Room not found");
+            return;
+        }
+
+        PlayerState self = findPlayer(room, user.userId);
+        if (self == null) {
+            emitError(user.userId, "Not in room");
+            return;
+        }
+
+        if (room.getStatus() != RoomStatus.ended) {
+            emitError(user.userId, "Current game is not ended");
+            return;
+        }
+
+        room.setBoard(GomokuEngine.createBoard());
+        prepareNextRoundStarter(room);
+        room.setMoves(new ArrayList<>());
+        room.setGameId(null);
+        room.setEndedAt(null);
+
+        for (PlayerState player : room.getPlayers()) {
+            WebSocketSession session = userSessions.get(player.getUserId());
+            boolean connected = session != null && session.isOpen();
+            player.setConnected(connected);
+            if (connected) {
+                player.setDisconnectedAt(null);
+            }
+        }
+
+        boolean readyToStart = room.getPlayers().size() >= 2
+                && room.getPlayers().stream().allMatch(PlayerState::isConnected);
+
+        if (readyToStart) {
+            room.setStatus(RoomStatus.in_progress);
+            room.setStartedAt(Instant.now());
+        } else {
+            room.setStatus(RoomStatus.waiting);
+            room.setStartedAt(null);
+        }
+
+        persistRoom(room);
+        broadcastRoomState(room);
+
+        if (readyToStart) {
+            broadcast(room, "game:start", Map.of(
+                    "roomCode", room.getCode(),
+                    "currentTurn", room.getCurrentTurn(),
+                    "players", room.getPlayers()
+            ));
+            return;
+        }
+
+        emit(user.userId, "system:notice", Map.of("message", "已重置棋盘，等待对手在线后开始"));
+    }
+
+    private void prepareNextRoundStarter(RoomState room) {
+        Integer starterColor = room.getNextStarterColor();
+        if (!isValidColor(starterColor)) {
+            starterColor = inferNextStarterColor(room);
+        }
+
+        room.setCurrentTurn(starterColor);
+        room.setNextStarterColor(starterColor == 1 ? 2 : 1);
+    }
+
+    private Integer inferNextStarterColor(RoomState room) {
+        List<MoveState> moves = room.getMoves();
+        if (moves != null && !moves.isEmpty() && isValidColor(moves.get(0).getColor())) {
+            return moves.get(0).getColor() == 1 ? 2 : 1;
+        }
+
+        if (room.getStatus() == RoomStatus.waiting && room.getGameId() == null && room.getStartedAt() == null) {
+            return 1;
+        }
+
+        Integer currentTurn = room.getCurrentTurn();
+        if (isValidColor(currentTurn)) {
+            return currentTurn == 1 ? 2 : 1;
+        }
+
+        return 1;
+    }
+
+    private boolean isValidColor(Integer color) {
+        return Objects.equals(color, 1) || Objects.equals(color, 2);
+    }
+
+    private boolean startWaitingRoomIfReady(RoomState room) {
+        boolean readyToStart = room.getStatus() == RoomStatus.waiting
+                && room.getPlayers().size() >= 2
+                && room.getPlayers().stream().allMatch(PlayerState::isConnected);
+        if (!readyToStart) {
+            return false;
+        }
+
+        room.setStatus(RoomStatus.in_progress);
+        room.setStartedAt(Instant.now());
+        room.setEndedAt(null);
+
+        persistRoom(room);
+        broadcastRoomState(room);
+        broadcast(room, "game:start", Map.of(
+                "roomCode", room.getCode(),
+                "currentTurn", room.getCurrentTurn(),
+                "players", room.getPlayers()
+        ));
+        return true;
     }
 
     private synchronized void handleMove(SessionUser user, String roomCode, int x, int y) {
@@ -424,9 +553,13 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         player.setDisconnectedAt(null);
         user.roomCode = roomCode;
         clearReconnectTimer(roomCode, user.userId);
-        persistRoom(room);
 
-        emit(user.userId, "room:state", Map.of("room", room));
+        boolean started = startWaitingRoomIfReady(room);
+        if (!started) {
+            persistRoom(room);
+            emit(user.userId, "room:state", Map.of("room", room));
+        }
+
         broadcast(room, "player:reconnected", Map.of(
                 "userId", user.userId,
                 "username", user.username

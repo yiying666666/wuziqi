@@ -116,6 +116,7 @@ public final class RoomModels {
         private String code;
         private int[][] board = GomokuEngine.createBoard();
         private Integer currentTurn = 1;
+        private Integer nextStarterColor = 1;
         private RoomStatus status = RoomStatus.waiting;
         private List<PlayerState> players = new ArrayList<>();
         private List<MoveState> moves = new ArrayList<>();
@@ -145,6 +146,14 @@ public final class RoomModels {
 
         public void setCurrentTurn(Integer currentTurn) {
             this.currentTurn = currentTurn;
+        }
+
+        public Integer getNextStarterColor() {
+            return nextStarterColor;
+        }
+
+        public void setNextStarterColor(Integer nextStarterColor) {
+            this.nextStarterColor = nextStarterColor;
         }
 
         public RoomStatus getStatus() {

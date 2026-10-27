@@ -196,8 +196,9 @@ start_deps() {
 
 start_backend() {
   if port_open 3000; then
-    log "Backend 已在运行 (port 3000)"
-    return
+    log "检测到 Backend 已在运行，先重启以应用最新代码..."
+    kill_pid_file "$BACKEND_PID_FILE" "Backend"
+    kill_port 3000
   fi
 
   [[ -f "$BACKEND_DIR/.env" ]] || cp "$BACKEND_DIR/.env.example" "$BACKEND_DIR/.env"
@@ -226,8 +227,9 @@ start_backend() {
 
 start_frontend() {
   if port_open 5173; then
-    log "Frontend 已在运行 (port 5173)"
-    return
+    log "检测到 Frontend 已在运行，先重启以应用最新页面代码..."
+    kill_pid_file "$FRONTEND_PID_FILE" "Frontend"
+    kill_port 5173
   fi
 
   if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then

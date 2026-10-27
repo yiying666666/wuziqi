@@ -191,7 +191,7 @@ const handleClick = (index: number): void => {
 
 @media (max-width: 430px) {
   .board-wrap {
-    width: min(94vw, 410px);
+    width: min(76vw, 340px);
   }
 }
 </style>

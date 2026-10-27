@@ -43,6 +43,25 @@
 
         <div class="card lobby-card">
           <h3>房间大厅</h3>
+          <p class="tip compact-tip">先手规则：黑白交替（上一局黑先，则下一局白先）</p>
+
+          <div class="difficulty-row">
+            <span>人机难度</span>
+            <div class="difficulty-options">
+              <button
+                v-for="item in AI_DIFFICULTY_OPTIONS"
+                :key="item.value"
+                type="button"
+                class="difficulty-btn"
+                :class="{ active: aiDifficulty === item.value }"
+                @click="aiDifficulty = item.value"
+                :title="item.desc"
+              >
+                {{ item.label }}
+              </button>
+            </div>
+          </div>
+
           <div class="actions mode-actions">
             <button class="primary" @click="createRoom">创建联机房间</button>
             <button class="secondary" @click="startAiGame">开始人机对战</button>
@@ -99,6 +118,8 @@
             <div v-else-if="aiGame" class="players">
               <span class="me">● 黑 你</span>
               <span>○ 白 AI</span>
+              <span class="starter-tag">本局{{ aiGame.starterColor === 1 ? "黑" : "白" }}先手</span>
+              <span class="starter-tag">难度：{{ aiDifficultyText }}</span>
             </div>
 
             <GomokuBoard
@@ -123,6 +144,17 @@
         </div>
       </section>
     </main>
+
+    <div v-if="resultDialog.visible" class="result-mask" @click.self="closeResultDialog">
+      <div class="result-dialog" :class="resultDialog.tone" role="dialog" aria-modal="true" aria-label="对局结果">
+        <h3>{{ resultDialog.title }}</h3>
+        <p>{{ resultDialog.message }}</p>
+        <div class="result-actions">
+          <button class="primary" @click="startNextGameFromDialog">开启下一局</button>
+          <button class="ghost" @click="closeResultDialog">稍后再说</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -135,8 +167,10 @@ import { SocketClient } from "./services/socket";
 import type { Profile, RoomState, StoneColor } from "./types";
 
 const BOARD_SIZE = 15;
-const HUMAN_COLOR: StoneColor = 1;
-const AI_COLOR: StoneColor = 2;
+const BLACK_STONE: StoneColor = 1;
+const WHITE_STONE: StoneColor = 2;
+const HUMAN_COLOR: StoneColor = BLACK_STONE;
+const AI_COLOR: StoneColor = WHITE_STONE;
 const DIRECTIONS: Array<[number, number]> = [
   [1, 0],
   [0, 1],
@@ -146,11 +180,39 @@ const DIRECTIONS: Array<[number, number]> = [
 
 interface PveGameState {
   board: number[][];
+  starterColor: StoneColor;
   currentTurn: StoneColor;
   status: "in_progress" | "ended";
   winnerColor: StoneColor | null;
   reason: "normal" | "draw";
 }
+
+type ResultTone = "win" | "lose" | "draw";
+type ResultMode = "online" | "ai";
+type AIDifficulty = "easy" | "medium" | "hard";
+
+interface ResultDialogState {
+  visible: boolean;
+  mode: ResultMode;
+  tone: ResultTone;
+  title: string;
+  message: string;
+}
+
+interface CandidateMove {
+  x: number;
+  y: number;
+  score: number;
+}
+
+const AI_DIFFICULTY_OPTIONS: Array<{ value: AIDifficulty; label: string; desc: string }> = [
+  { value: "easy", label: "简单", desc: "偏随机，适合新手" },
+  { value: "medium", label: "普通", desc: "稳健攻防，推荐" },
+  { value: "hard", label: "困难", desc: "带搜索，更强" },
+];
+
+const HARD_SEARCH_DEPTH = 3;
+const HARD_BRANCHING = 6;
 
 const createEmptyBoard = (): number[][] =>
   Array.from({ length: BOARD_SIZE }, () => Array.from({ length: BOARD_SIZE }, () => 0));
@@ -273,46 +335,172 @@ const evaluatePoint = (board: number[][], x: number, y: number, color: number): 
   return score;
 };
 
-const pickBestAIMove = (board: number[][]): { x: number; y: number } | null => {
+const oppositeColor = (color: StoneColor): StoneColor => (color === BLACK_STONE ? WHITE_STONE : BLACK_STONE);
+
+const rankCandidateMoves = (
+  board: number[][],
+  selfColor: StoneColor,
+  otherColor: StoneColor,
+): CandidateMove[] => {
   const candidates = collectCandidates(board);
-  if (!candidates.length) return null;
+  return candidates
+    .map((point) => {
+      board[point.y][point.x] = selfColor;
+      const attack = evaluatePoint(board, point.x, point.y, selfColor);
+      board[point.y][point.x] = otherColor;
+      const defend = evaluatePoint(board, point.x, point.y, otherColor);
+      board[point.y][point.x] = 0;
 
+      return {
+        x: point.x,
+        y: point.y,
+        score: attack * 1.15 + defend,
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+};
+
+const findImmediateWin = (board: number[][], color: StoneColor): { x: number; y: number } | null => {
+  const candidates = collectCandidates(board);
   for (const point of candidates) {
-    if (wouldWin(board, point.x, point.y, AI_COLOR)) {
+    if (wouldWin(board, point.x, point.y, color)) {
       return point;
     }
   }
+  return null;
+};
 
-  for (const point of candidates) {
-    if (wouldWin(board, point.x, point.y, HUMAN_COLOR)) {
-      return point;
+const evaluateBoardState = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): number => {
+  const rankedForAI = rankCandidateMoves(board, aiColor, humanColor);
+  const rankedForHuman = rankCandidateMoves(board, humanColor, aiColor);
+
+  const aiBest = rankedForAI[0]?.score ?? 0;
+  const aiSecond = rankedForAI[1]?.score ?? 0;
+  const humanBest = rankedForHuman[0]?.score ?? 0;
+  const humanSecond = rankedForHuman[1]?.score ?? 0;
+
+  return aiBest * 1.1 + aiSecond * 0.45 - (humanBest * 1.2 + humanSecond * 0.55);
+};
+
+const negamax = (
+  board: number[][],
+  depth: number,
+  currentColor: StoneColor,
+  aiColor: StoneColor,
+  alpha: number,
+  beta: number,
+): number => {
+  const humanColor = oppositeColor(aiColor);
+  if (depth === 0 || isBoardFull(board)) {
+    const evalScore = evaluateBoardState(board, aiColor, humanColor);
+    return currentColor === aiColor ? evalScore : -evalScore;
+  }
+
+  const rankedMoves = rankCandidateMoves(board, currentColor, oppositeColor(currentColor)).slice(0, HARD_BRANCHING);
+  if (!rankedMoves.length) {
+    const evalScore = evaluateBoardState(board, aiColor, humanColor);
+    return currentColor === aiColor ? evalScore : -evalScore;
+  }
+
+  let best = Number.NEGATIVE_INFINITY;
+  let localAlpha = alpha;
+
+  for (const move of rankedMoves) {
+    board[move.y][move.x] = currentColor;
+
+    const score = checkWinAt(board, move.x, move.y, currentColor)
+      ? 900000 + depth * 1000
+      : -negamax(board, depth - 1, oppositeColor(currentColor), aiColor, -beta, -localAlpha);
+
+    board[move.y][move.x] = 0;
+
+    if (score > best) {
+      best = score;
+    }
+    if (best > localAlpha) {
+      localAlpha = best;
+    }
+    if (localAlpha >= beta) {
+      break;
     }
   }
 
-  let bestPoints: Array<{ x: number; y: number }> = [];
+  return best;
+};
+
+const pickEasyAIMove = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): { x: number; y: number } | null => {
+  const winNow = findImmediateWin(board, aiColor);
+  if (winNow) return winNow;
+
+  const mustBlock = findImmediateWin(board, humanColor);
+  if (mustBlock && Math.random() < 0.75) {
+    return mustBlock;
+  }
+
+  const ranked = rankCandidateMoves(board, aiColor, humanColor);
+  if (!ranked.length) return null;
+  const choicePool = ranked.slice(0, Math.min(6, ranked.length));
+  const pick = choicePool[Math.floor(Math.random() * choicePool.length)];
+  return { x: pick.x, y: pick.y };
+};
+
+const pickMediumAIMove = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): { x: number; y: number } | null => {
+  const winNow = findImmediateWin(board, aiColor);
+  if (winNow) return winNow;
+
+  const mustBlock = findImmediateWin(board, humanColor);
+  if (mustBlock) return mustBlock;
+
+  const ranked = rankCandidateMoves(board, aiColor, humanColor);
+  if (!ranked.length) return null;
+  const topScore = ranked[0].score;
+  const bestPoints = ranked.filter((move) => move.score === topScore);
+  const pick = bestPoints[Math.floor(Math.random() * bestPoints.length)] ?? ranked[0];
+  return { x: pick.x, y: pick.y };
+};
+
+const pickHardAIMove = (board: number[][], aiColor: StoneColor, humanColor: StoneColor): { x: number; y: number } | null => {
+  const winNow = findImmediateWin(board, aiColor);
+  if (winNow) return winNow;
+
+  const mustBlock = findImmediateWin(board, humanColor);
+  if (mustBlock) return mustBlock;
+
+  const rootCandidates = rankCandidateMoves(board, aiColor, humanColor).slice(0, HARD_BRANCHING + 1);
+  if (!rootCandidates.length) return null;
+
+  let bestMove = rootCandidates[0];
   let bestScore = Number.NEGATIVE_INFINITY;
 
-  for (const point of candidates) {
-    board[point.y][point.x] = AI_COLOR;
-    const attack = evaluatePoint(board, point.x, point.y, AI_COLOR);
-    board[point.y][point.x] = HUMAN_COLOR;
-    const defend = evaluatePoint(board, point.x, point.y, HUMAN_COLOR);
-    board[point.y][point.x] = 0;
+  for (const move of rootCandidates) {
+    board[move.y][move.x] = aiColor;
+    const score = checkWinAt(board, move.x, move.y, aiColor)
+      ? 1_000_000
+      : -negamax(board, HARD_SEARCH_DEPTH - 1, humanColor, aiColor, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
+    board[move.y][move.x] = 0;
 
-    const score = attack * 1.15 + defend;
     if (score > bestScore) {
       bestScore = score;
-      bestPoints = [point];
-    } else if (score === bestScore) {
-      bestPoints.push(point);
+      bestMove = move;
     }
   }
 
-  if (!bestPoints.length) {
-    return candidates[0];
-  }
+  return { x: bestMove.x, y: bestMove.y };
+};
 
-  return bestPoints[Math.floor(Math.random() * bestPoints.length)];
+const pickBestAIMove = (
+  board: number[][],
+  aiColor: StoneColor,
+  humanColor: StoneColor,
+  difficulty: AIDifficulty,
+): { x: number; y: number } | null => {
+  if (difficulty === "easy") {
+    return pickEasyAIMove(board, aiColor, humanColor);
+  }
+  if (difficulty === "hard") {
+    return pickHardAIMove(board, aiColor, humanColor);
+  }
+  return pickMediumAIMove(board, aiColor, humanColor);
 };
 
 const session = useSession();
@@ -330,15 +518,66 @@ const errorMessage = ref("");
 const notice = ref("");
 const reconnectText = ref("网络连接中...");
 const connectionState = ref<"connected" | "reconnecting" | "closed">("closed");
+const resultDialog = ref<ResultDialogState>({
+  visible: false,
+  mode: "online",
+  tone: "draw",
+  title: "",
+  message: "",
+});
+const nextAiStarterColor = ref<StoneColor>(BLACK_STONE);
+const aiDifficulty = ref<AIDifficulty>("medium");
 
 const cleanupFns: Array<() => void> = [];
 let aiTimer: ReturnType<typeof setTimeout> | null = null;
+
+const stoneText = (color: StoneColor): string => (color === BLACK_STONE ? "黑棋" : "白棋");
+const aiDifficultyText = computed(
+  () => AI_DIFFICULTY_OPTIONS.find((item) => item.value === aiDifficulty.value)?.label ?? "普通",
+);
 
 const clearAiTimer = (): void => {
   if (aiTimer) {
     clearTimeout(aiTimer);
     aiTimer = null;
   }
+};
+
+const openResultDialog = (
+  mode: ResultMode,
+  tone: ResultTone,
+  title: string,
+  message: string,
+): void => {
+  resultDialog.value = {
+    visible: true,
+    mode,
+    tone,
+    title,
+    message,
+  };
+};
+
+const closeResultDialog = (): void => {
+  resultDialog.value.visible = false;
+};
+
+const startNextGameFromDialog = (): void => {
+  const mode = resultDialog.value.mode;
+  closeResultDialog();
+
+  if (mode === "ai") {
+    startAiGame();
+    return;
+  }
+
+  if (room.value?.code) {
+    socket.send("room:restart", { roomCode: room.value.code });
+    notice.value = "已请求在当前房间开启下一局";
+    return;
+  }
+
+  createRoom();
 };
 
 const isLoggedIn = computed(() => Boolean(session.state.token && session.state.user));
@@ -366,7 +605,9 @@ const gameStatusText = computed(() => {
       if (aiGame.value.reason === "draw") return "人机对战结束：平局";
       return aiGame.value.winnerColor === HUMAN_COLOR ? "人机对战结束：你赢了 🎉" : "人机对战结束：AI 获胜";
     }
-    return aiGame.value.currentTurn === HUMAN_COLOR ? "你的回合（黑棋）" : "AI 思考中（白棋）";
+    return aiGame.value.currentTurn === HUMAN_COLOR
+      ? `你的回合（${stoneText(HUMAN_COLOR)}）｜难度 ${aiDifficultyText.value}`
+      : `AI 回合（${stoneText(AI_COLOR)}）｜难度 ${aiDifficultyText.value}`;
   }
 
   if (!room.value) return "";
@@ -380,7 +621,9 @@ const turnTip = computed(() => {
     if (aiGame.value.status === "ended") {
       return "可点击“开始人机对战”再来一局，或回到联机模式。";
     }
-    return aiGame.value.currentTurn === HUMAN_COLOR ? "轮到你落子" : "AI 正在思考...";
+    return aiGame.value.currentTurn === HUMAN_COLOR
+      ? "轮到你落子"
+      : `AI 正在思考（本局${stoneText(aiGame.value.starterColor)}先手）...`;
   }
 
   if (!room.value) return "";
@@ -390,7 +633,7 @@ const turnTip = computed(() => {
   if (room.value.status === "waiting") {
     return "等待第二位玩家加入…";
   }
-  return "本局已结束，可创建/加入新房间继续。";
+  return "本局已结束，可在当前房间点击“开启下一局”。";
 });
 
 const resetMessages = (): void => {
@@ -419,10 +662,12 @@ const toggleAuthMode = (): void => {
 const stopAiGame = (): void => {
   clearAiTimer();
   aiGame.value = null;
+  closeResultDialog();
 };
 
 const createRoom = (): void => {
   resetMessages();
+  closeResultDialog();
   stopAiGame();
   socket.send("room:create", {});
 };
@@ -433,6 +678,7 @@ const joinRoom = (): void => {
     return;
   }
   resetMessages();
+  closeResultDialog();
   stopAiGame();
   socket.send("room:join", { code: joinCode.value.toUpperCase() });
 };
@@ -440,11 +686,13 @@ const joinRoom = (): void => {
 const leaveRoom = (): void => {
   socket.send("room:leave", {});
   room.value = null;
+  closeResultDialog();
 };
 
-const createNewAiGame = (): PveGameState => ({
+const createNewAiGame = (starterColor: StoneColor): PveGameState => ({
   board: createEmptyBoard(),
-  currentTurn: HUMAN_COLOR,
+  starterColor,
+  currentTurn: starterColor,
   status: "in_progress",
   winnerColor: null,
   reason: "normal",
@@ -452,11 +700,25 @@ const createNewAiGame = (): PveGameState => ({
 
 const startAiGame = (): void => {
   resetMessages();
+  closeResultDialog();
   if (room.value) {
     leaveRoom();
   }
-  aiGame.value = createNewAiGame();
-  notice.value = "已开始人机对战：你执黑先行";
+
+  const starterColor = nextAiStarterColor.value;
+  nextAiStarterColor.value = starterColor === BLACK_STONE ? WHITE_STONE : BLACK_STONE;
+  aiGame.value = createNewAiGame(starterColor);
+
+  if (starterColor === HUMAN_COLOR) {
+    notice.value = `已开始人机对战（${aiDifficultyText.value}）：本局黑棋先行（你先手）`;
+    return;
+  }
+
+  notice.value = `已开始人机对战（${aiDifficultyText.value}）：本局白棋先行（AI 先手）`;
+  clearAiTimer();
+  aiTimer = setTimeout(() => {
+    makeAiMove();
+  }, 420);
 };
 
 const finishAiGame = (winnerColor: StoneColor | null, reason: "normal" | "draw"): void => {
@@ -465,6 +727,18 @@ const finishAiGame = (winnerColor: StoneColor | null, reason: "normal" | "draw")
   aiGame.value.winnerColor = winnerColor;
   aiGame.value.reason = reason;
   clearAiTimer();
+
+  if (reason === "draw" || winnerColor === null) {
+    openResultDialog("ai", "draw", "本局平局", "是否开启下一局人机对战？");
+    return;
+  }
+
+  if (winnerColor === HUMAN_COLOR) {
+    openResultDialog("ai", "win", "恭喜你获胜 🎉", "是否立即开启下一局人机对战？");
+    return;
+  }
+
+  openResultDialog("ai", "lose", "很遗憾你输了", "是否立即开启下一局再挑战 AI？");
 };
 
 const makeAiMove = (): void => {
@@ -473,7 +747,7 @@ const makeAiMove = (): void => {
   }
 
   const board = aiGame.value.board;
-  const point = pickBestAIMove(board);
+  const point = pickBestAIMove(board, AI_COLOR, HUMAN_COLOR, aiDifficulty.value);
   if (!point) {
     finishAiGame(null, "draw");
     return;
@@ -558,6 +832,7 @@ const logout = (): void => {
   stopAiGame();
   profile.value = null;
   connectionState.value = "closed";
+  closeResultDialog();
 };
 
 const bindSocketEvents = (): void => {
@@ -570,6 +845,32 @@ const bindSocketEvents = (): void => {
       room.value = typed.room;
       if (typed.room.code) {
         joinCode.value = typed.room.code;
+      }
+      if (typed.room.status === "in_progress" && typed.room.moves.length === 0) {
+        closeResultDialog();
+      }
+    }),
+  );
+
+  cleanupFns.push(
+    socket.on("game:start", (payload) => {
+      if (aiGame.value) {
+        return;
+      }
+      const typed = payload as { roomCode?: string; currentTurn?: StoneColor };
+      closeResultDialog();
+      const starter = typed.currentTurn ? `${stoneText(typed.currentTurn)}先手` : "已开始";
+      notice.value = typed.roomCode
+        ? `新一局已在房间 ${typed.roomCode} 开始（${starter}）`
+        : `新一局${starter}`;
+    }),
+  );
+
+  cleanupFns.push(
+    socket.on("system:notice", (payload) => {
+      const typed = payload as { message?: string };
+      if (typed.message) {
+        notice.value = typed.message;
       }
     }),
   );
@@ -603,11 +904,29 @@ const bindSocketEvents = (): void => {
   );
 
   cleanupFns.push(
-    socket.on("game:ended", async () => {
+    socket.on("game:ended", async (payload) => {
       if (aiGame.value) {
         return;
       }
-      notice.value = "联机对局已结束，战绩和 Elo 已更新";
+
+      const typed = payload as {
+        winnerUserId?: number | null;
+        winnerColor?: number | null;
+        reason?: string;
+      };
+      const myUserId = session.state.user?.id;
+
+      if (!typed.winnerUserId || typed.reason === "draw") {
+        notice.value = "联机对局结束：平局";
+        openResultDialog("online", "draw", "联机对局平局", "是否在当前房间开启下一局？");
+      } else if (myUserId && typed.winnerUserId === myUserId) {
+        notice.value = "联机对局结束：你获胜了！";
+        openResultDialog("online", "win", "你赢了 🎉", "是否在当前房间开启下一局？");
+      } else {
+        notice.value = "联机对局结束：你输了";
+        openResultDialog("online", "lose", "这局惜败", "是否在当前房间再来一局？");
+      }
+
       try {
         await loadProfile();
       } catch (error) {
@@ -689,7 +1008,7 @@ const onVisibilityChange = (): void => {
 
 .topbar {
   text-align: center;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
 .topbar h1 {
@@ -700,6 +1019,7 @@ const onVisibilityChange = (): void => {
 .topbar p {
   margin: 4px 0 0;
   color: #666;
+  font-size: 14px;
 }
 
 .network-banner {
@@ -799,21 +1119,60 @@ button.mini {
 
 .actions,
 .join-row {
-  display: flex;
+  display: grid;
   gap: 8px;
   margin-bottom: 8px;
 }
 
 .mode-actions {
-  flex-wrap: wrap;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .mode-actions button {
-  flex: 1;
+  width: 100%;
+}
+
+.join-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
 }
 
 .join-row input {
-  flex: 1;
+  min-width: 0;
+}
+
+.difficulty-row {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.difficulty-row > span {
+  color: #667085;
+  font-size: 13px;
+}
+
+.difficulty-options {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.difficulty-btn {
+  min-height: 34px;
+  border-radius: 999px;
+  background: #f5f7fb;
+  border: 1px solid #dbe2eb;
+  color: #334155;
+  font-size: 13px;
+  padding: 0 8px;
+}
+
+.difficulty-btn.active {
+  background: #e8f0ff;
+  border-color: #7ea6ff;
+  color: #154ab5;
+  font-weight: 600;
 }
 
 .game-card {
@@ -836,6 +1195,11 @@ button.mini {
   font-size: 14px;
 }
 
+.players .starter-tag {
+  background: #fff7e6;
+  border: 1px solid #f4cf83;
+}
+
 .players span.me {
   border: 1px solid #1f6feb;
 }
@@ -849,9 +1213,66 @@ button.mini {
   color: #555;
 }
 
+.compact-tip {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
 .error {
   margin: 0;
   color: #c62828;
+}
+
+.result-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 40%);
+  padding: 16px;
+}
+
+.result-dialog {
+  width: min(92vw, 360px);
+  background: #fff;
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 16px 40px rgb(0 0 0 / 24%);
+  border: 2px solid #dbe2eb;
+}
+
+.result-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.result-dialog p {
+  margin: 0;
+  color: #444;
+}
+
+.result-dialog.win {
+  border-color: #4caf50;
+}
+
+.result-dialog.lose {
+  border-color: #ef5350;
+}
+
+.result-dialog.draw {
+  border-color: #90a4ae;
+}
+
+.result-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.result-actions button {
+  min-width: 106px;
 }
 
 @media (max-width: 900px) {
@@ -865,17 +1286,64 @@ button.mini {
 }
 
 @media (max-width: 430px) {
-  .card {
-    padding: 12px;
+  .app-shell {
+    padding-top: max(8px, env(safe-area-inset-top));
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
   }
 
-  .actions,
-  .join-row {
-    flex-direction: column;
+  .topbar h1 {
+    font-size: 21px;
+  }
+
+  .topbar p {
+    display: none;
+  }
+
+  .card {
+    padding: 10px;
+  }
+
+  input,
+  button {
+    min-height: 40px;
+    font-size: 14px;
+  }
+
+  .layout,
+  .left-col,
+  .right-col {
+    gap: 8px;
+  }
+
+  .lobby-card {
+    position: sticky;
+    top: max(6px, env(safe-area-inset-top));
+    z-index: 2;
   }
 
   .game-head {
     align-items: start;
+    flex-direction: column;
+  }
+
+  .players span {
+    font-size: 12px;
+    padding: 4px 8px;
+  }
+
+  .difficulty-options {
+    gap: 4px;
+  }
+
+  .difficulty-btn {
+    min-height: 32px;
+    font-size: 12px;
+    padding: 0 6px;
+  }
+
+  .result-actions {
     flex-direction: column;
   }
 }
