@@ -1,0 +1,15 @@
+.git
+.gitignore
+.idea
+.claude
+.run
+.data
+.DS_Store
+**/.DS_Store
+**/node_modules
+frontend/dist
+backend/target
+**/.env
+**/.env.*
+!**/.env.example
+scripts/__pycache__
