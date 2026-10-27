@@ -1,0 +1,27 @@
+server:
+  port: ${PORT:3000}
+
+spring:
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/wuziqi}
+    username: ${DATABASE_USERNAME:wuziqi}
+    password: ${DATABASE_PASSWORD:wuziqi}
+  jpa:
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+app:
+  cors-origin: ${CORS_ORIGIN:http://localhost:5173}
+  jwt-secret: ${JWT_SECRET:replace_me_with_long_random_secret_key_please}
+  jwt-expire-days: ${JWT_EXPIRE_DAYS:7}
+  reconnect-grace-seconds: ${RECONNECT_GRACE_SECONDS:30}
+  redis-enabled: ${REDIS_ENABLED:true}

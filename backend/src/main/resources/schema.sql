@@ -1,0 +1,43 @@
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  username VARCHAR(32) NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ratings (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  elo INTEGER NOT NULL DEFAULT 1200,
+  win_count INTEGER NOT NULL DEFAULT 0,
+  lose_count INTEGER NOT NULL DEFAULT 0,
+  draw_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS games (
+  id BIGSERIAL PRIMARY KEY,
+  room_code VARCHAR(12) NOT NULL,
+  black_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  white_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  winner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  result VARCHAR(10) NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  ended_at TIMESTAMPTZ NOT NULL,
+  board_snapshot TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS game_moves (
+  id BIGSERIAL PRIMARY KEY,
+  game_id BIGINT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  move_no INTEGER NOT NULL,
+  x INTEGER NOT NULL,
+  y INTEGER NOT NULL,
+  color SMALLINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(game_id, move_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_games_ended_at ON games(ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_games_black ON games(black_user_id);
+CREATE INDEX IF NOT EXISTS idx_games_white ON games(white_user_id);
+CREATE INDEX IF NOT EXISTS idx_ratings_elo ON ratings(elo DESC);

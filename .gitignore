@@ -1,0 +1,36 @@
+# OS
+.DS_Store
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+coverage/
+
+# Java / Maven
+backend/target/
+*.class
+
+# IDE
+.vscode/
+.idea/
+backend/.idea/
+
+# Runtime / cache
+.run/
+.data/
+.claude/
+__pycache__/
+scripts/__pycache__/
+*.log
+*.pid
+
+# Python virtual env
+.venv/
+venv/
