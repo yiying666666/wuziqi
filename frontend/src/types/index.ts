@@ -45,6 +45,8 @@ export interface RoomState {
   code: string;
   board: number[][];
   currentTurn: StoneColor;
+  pendingUndoRequesterUserId?: number;
+  pendingUndoRequestedAt?: string;
   status: "waiting" | "in_progress" | "ended";
   players: RoomPlayer[];
   moves: Move[];

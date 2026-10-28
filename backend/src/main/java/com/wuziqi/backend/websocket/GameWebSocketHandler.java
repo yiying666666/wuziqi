@@ -138,6 +138,15 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
                     int y = payload.path("y").asInt(-1);
                     handleMove(user, roomCode, x, y);
                 }
+                case "game:undo_request" -> {
+                    String roomCode = payload.path("roomCode").asText("").toUpperCase(Locale.ROOT);
+                    handleUndoRequest(user, roomCode);
+                }
+                case "game:undo_response" -> {
+                    String roomCode = payload.path("roomCode").asText("").toUpperCase(Locale.ROOT);
+                    boolean accept = payload.path("accept").asBoolean(false);
+                    handleUndoResponse(user, roomCode, accept);
+                }
                 default -> emitError(user.userId, "Unknown event: " + event);
             }
         } catch (ApiException ex) {
@@ -237,6 +246,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         prepareNextRoundStarter(room);
         room.setStatus(RoomStatus.in_progress);
         room.setStartedAt(Instant.now());
+        clearPendingUndoRequest(room);
 
         user.roomCode = room.getCode();
         roomCacheService.saveUserRoom(user.userId, room.getCode());
@@ -277,6 +287,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         if (room.getStatus() == RoomStatus.in_progress) {
             room.setStatus(RoomStatus.ended);
             room.setEndedAt(Instant.now());
+            clearPendingUndoRequest(room);
 
             PlayerState leaver = findPlayer(room, user.userId);
             if (leaver != null) {
@@ -329,6 +340,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         room.setMoves(new ArrayList<>());
         room.setGameId(null);
         room.setEndedAt(null);
+        clearPendingUndoRequest(room);
 
         for (PlayerState player : room.getPlayers()) {
             WebSocketSession session = userSessions.get(player.getUserId());
@@ -408,6 +420,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         room.setStatus(RoomStatus.in_progress);
         room.setStartedAt(Instant.now());
         room.setEndedAt(null);
+        clearPendingUndoRequest(room);
 
         persistRoom(room);
         broadcastRoomState(room);
@@ -417,6 +430,162 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
                 "players", room.getPlayers()
         ));
         return true;
+    }
+
+    private synchronized void handleUndoRequest(SessionUser user, String roomCode) {
+        if (roomCode.isBlank()) {
+            emitError(user.userId, "Missing room code");
+            return;
+        }
+
+        RoomState room = getRoom(roomCode);
+        if (room == null || room.getStatus() != RoomStatus.in_progress) {
+            emitError(user.userId, "Room not available");
+            return;
+        }
+
+        PlayerState self = findPlayer(room, user.userId);
+        if (self == null) {
+            emitError(user.userId, "Not in room");
+            return;
+        }
+
+        PlayerState opponent = findOpponent(room, user.userId);
+        if (opponent == null) {
+            emitError(user.userId, "等待对手加入后再悔棋");
+            return;
+        }
+
+        if (room.getMoves().isEmpty()) {
+            emitError(user.userId, "当前还没有可悔棋的落子");
+            return;
+        }
+
+        if (hasPendingUndoRequest(room)) {
+            emitError(user.userId, "已有待处理的悔棋请求");
+            return;
+        }
+
+        room.setPendingUndoRequesterUserId(user.userId);
+        room.setPendingUndoRequestedAt(Instant.now());
+        persistRoom(room);
+        broadcastRoomState(room);
+
+        emit(user.userId, "game:undo_requested", Map.of(
+                "roomCode", room.getCode(),
+                "requesterUserId", user.userId,
+                "requesterUsername", user.username
+        ));
+
+        emit(opponent.getUserId(), "game:undo_request_received", Map.of(
+                "roomCode", room.getCode(),
+                "requesterUserId", user.userId,
+                "requesterUsername", user.username
+        ));
+    }
+
+    private synchronized void handleUndoResponse(SessionUser user, String roomCode, boolean accept) {
+        if (roomCode.isBlank()) {
+            emitError(user.userId, "Missing room code");
+            return;
+        }
+
+        RoomState room = getRoom(roomCode);
+        if (room == null || room.getStatus() != RoomStatus.in_progress) {
+            emitError(user.userId, "Room not available");
+            return;
+        }
+
+        PlayerState self = findPlayer(room, user.userId);
+        if (self == null) {
+            emitError(user.userId, "Not in room");
+            return;
+        }
+
+        Integer requesterUserId = room.getPendingUndoRequesterUserId();
+        if (requesterUserId == null) {
+            emitError(user.userId, "当前没有待处理的悔棋请求");
+            return;
+        }
+
+        if (Objects.equals(requesterUserId, user.userId)) {
+            emitError(user.userId, "不能处理自己发起的悔棋请求");
+            return;
+        }
+
+        PlayerState requester = findPlayer(room, requesterUserId);
+        if (requester == null) {
+            clearPendingUndoRequest(room);
+            persistRoom(room);
+            broadcastRoomState(room);
+            emitError(user.userId, "悔棋请求已失效");
+            return;
+        }
+
+        if (!accept) {
+            clearPendingUndoRequest(room);
+            persistRoom(room);
+            broadcastRoomState(room);
+            emit(requesterUserId, "game:undo_rejected", Map.of(
+                    "roomCode", room.getCode(),
+                    "responderUserId", user.userId,
+                    "responderUsername", user.username
+            ));
+            emit(user.userId, "system:notice", Map.of("message", "你已拒绝对方悔棋请求"));
+            return;
+        }
+
+        if (room.getMoves().isEmpty()) {
+            clearPendingUndoRequest(room);
+            persistRoom(room);
+            broadcastRoomState(room);
+            emitError(user.userId, "当前没有可悔棋的落子");
+            return;
+        }
+
+        MoveState lastMove = room.getMoves().remove(room.getMoves().size() - 1);
+        if (lastMove.getX() == null || lastMove.getY() == null || lastMove.getColor() == null) {
+            clearPendingUndoRequest(room);
+            persistRoom(room);
+            broadcastRoomState(room);
+            emitError(user.userId, "悔棋失败，请稍后重试");
+            return;
+        }
+
+        if (!GomokuEngine.isInBounds(lastMove.getX(), lastMove.getY())) {
+            clearPendingUndoRequest(room);
+            persistRoom(room);
+            broadcastRoomState(room);
+            emitError(user.userId, "悔棋失败，落子坐标异常");
+            return;
+        }
+
+        room.getBoard()[lastMove.getY()][lastMove.getX()] = 0;
+        room.setCurrentTurn(lastMove.getColor());
+
+        for (int i = 0; i < room.getMoves().size(); i++) {
+            room.getMoves().get(i).setMoveNo(i + 1);
+        }
+
+        clearPendingUndoRequest(room);
+        persistRoom(room);
+        broadcastRoomState(room);
+
+        Map<String, Object> payload = Map.of(
+                "roomCode", room.getCode(),
+                "requesterUserId", requesterUserId,
+                "requesterUsername", requester.getUsername(),
+                "responderUserId", user.userId,
+                "responderUsername", user.username,
+                "revertedMove", Map.of(
+                        "x", lastMove.getX(),
+                        "y", lastMove.getY(),
+                        "color", lastMove.getColor(),
+                        "moveNo", lastMove.getMoveNo()
+                ),
+                "nextTurn", room.getCurrentTurn()
+        );
+        broadcast(room, "game:undo_applied", payload);
     }
 
     private synchronized void handleMove(SessionUser user, String roomCode, int x, int y) {
@@ -439,6 +608,11 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
 
         if (!Objects.equals(player.getColor(), room.getCurrentTurn())) {
             emit(user.userId, "game:invalid_move", Map.of("message", "Not your turn"));
+            return;
+        }
+
+        if (hasPendingUndoRequest(room)) {
+            emit(user.userId, "game:invalid_move", Map.of("message", "等待悔棋请求处理后再落子"));
             return;
         }
 
@@ -468,6 +642,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         if (won || draw) {
             room.setStatus(RoomStatus.ended);
             room.setEndedAt(Instant.now());
+            clearPendingUndoRequest(room);
             Integer winnerColor = won ? player.getColor() : null;
             settleGame(room, winnerColor, won ? "normal" : "draw");
             persistRoom(room);
@@ -584,6 +759,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
 
                 room.setStatus(RoomStatus.ended);
                 room.setEndedAt(Instant.now());
+                clearPendingUndoRequest(room);
 
                 PlayerState winner = room.getPlayers().stream()
                         .filter(p -> !Objects.equals(p.getUserId(), userId))
@@ -612,6 +788,15 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         if (future != null) {
             future.cancel(false);
         }
+    }
+
+    private boolean hasPendingUndoRequest(RoomState room) {
+        return room.getPendingUndoRequesterUserId() != null;
+    }
+
+    private void clearPendingUndoRequest(RoomState room) {
+        room.setPendingUndoRequesterUserId(null);
+        room.setPendingUndoRequestedAt(null);
     }
 
     private void settleGame(RoomState room, Integer winnerColor, String reason) {
@@ -787,6 +972,15 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
     private PlayerState findPlayer(RoomState room, Integer userId) {
         for (PlayerState player : room.getPlayers()) {
             if (Objects.equals(player.getUserId(), userId)) {
+                return player;
+            }
+        }
+        return null;
+    }
+
+    private PlayerState findOpponent(RoomState room, Integer userId) {
+        for (PlayerState player : room.getPlayers()) {
+            if (!Objects.equals(player.getUserId(), userId)) {
                 return player;
             }
         }

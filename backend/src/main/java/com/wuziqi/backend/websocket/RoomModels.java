@@ -117,6 +117,8 @@ public final class RoomModels {
         private int[][] board = GomokuEngine.createBoard();
         private Integer currentTurn = 1;
         private Integer nextStarterColor = 1;
+        private Integer pendingUndoRequesterUserId;
+        private Instant pendingUndoRequestedAt;
         private RoomStatus status = RoomStatus.waiting;
         private List<PlayerState> players = new ArrayList<>();
         private List<MoveState> moves = new ArrayList<>();
@@ -154,6 +156,22 @@ public final class RoomModels {
 
         public void setNextStarterColor(Integer nextStarterColor) {
             this.nextStarterColor = nextStarterColor;
+        }
+
+        public Integer getPendingUndoRequesterUserId() {
+            return pendingUndoRequesterUserId;
+        }
+
+        public void setPendingUndoRequesterUserId(Integer pendingUndoRequesterUserId) {
+            this.pendingUndoRequesterUserId = pendingUndoRequesterUserId;
+        }
+
+        public Instant getPendingUndoRequestedAt() {
+            return pendingUndoRequestedAt;
+        }
+
+        public void setPendingUndoRequestedAt(Instant pendingUndoRequestedAt) {
+            this.pendingUndoRequestedAt = pendingUndoRequestedAt;
         }
 
         public RoomStatus getStatus() {

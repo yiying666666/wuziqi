@@ -115,6 +115,17 @@
               </span>
             </div>
 
+            <div v-if="room && room.status === 'in_progress'" class="undo-panel">
+              <button class="ghost mini" :disabled="!canRequestUndo" @click="requestUndo">请求悔棋</button>
+
+              <template v-if="isUndoPending && !isUndoRequesterMe">
+                <button class="primary mini" @click="respondUndo(true)">同意悔棋</button>
+                <button class="ghost mini" @click="respondUndo(false)">拒绝悔棋</button>
+              </template>
+
+              <span v-if="isUndoPending" class="undo-hint">{{ undoHintText }}</span>
+            </div>
+
             <div v-else-if="aiGame" class="players">
               <span class="me">● 黑 你</span>
               <span>○ 白 AI</span>
@@ -322,10 +333,40 @@ const startNextGameFromDialog = (): void => {
 };
 
 const isLoggedIn = computed(() => Boolean(session.state.token && session.state.user));
+const myUserId = computed(() => session.state.user?.id ?? null);
 
 const myPlayer = computed(() =>
   room.value?.players.find((item) => item.userId === session.state.user?.id),
 );
+
+const undoRequester = computed(() => {
+  if (!room.value?.pendingUndoRequesterUserId) {
+    return null;
+  }
+  return room.value.players.find((item) => item.userId === room.value?.pendingUndoRequesterUserId) ?? null;
+});
+
+const isUndoPending = computed(() => Boolean(room.value?.pendingUndoRequesterUserId));
+const isUndoRequesterMe = computed(
+  () => Boolean(room.value?.pendingUndoRequesterUserId && room.value.pendingUndoRequesterUserId === myUserId.value),
+);
+const canRequestUndo = computed(
+  () => Boolean(room.value
+    && room.value.status === "in_progress"
+    && room.value.moves.length > 0
+    && !isUndoPending.value),
+);
+const undoHintText = computed(() => {
+  if (!room.value || !isUndoPending.value) {
+    return "";
+  }
+
+  const requesterName = undoRequester.value?.username ?? "对手";
+  if (isUndoRequesterMe.value) {
+    return "已发起悔棋请求，等待对手确认";
+  }
+  return `${requesterName} 请求悔棋，请选择同意或拒绝`;
+});
 
 const isMyTurn = computed(
   () => room.value?.status === "in_progress" && myPlayer.value?.color === room.value.currentTurn,
@@ -337,7 +378,7 @@ const boardDisabled = computed(() => {
   if (aiGame.value) {
     return aiGame.value.status !== "in_progress" || aiGame.value.currentTurn !== HUMAN_COLOR;
   }
-  return !isMyTurn.value || room.value?.status !== "in_progress";
+  return !isMyTurn.value || room.value?.status !== "in_progress" || isUndoPending.value;
 });
 
 const gameStatusText = computed(() => {
@@ -368,6 +409,9 @@ const turnTip = computed(() => {
   }
 
   if (!room.value) return "";
+  if (isUndoPending.value) {
+    return undoHintText.value;
+  }
   if (room.value.status === "in_progress") {
     return isMyTurn.value ? "轮到你落子" : "等待对手落子";
   }
@@ -428,6 +472,22 @@ const leaveRoom = (): void => {
   socket.send("room:leave", {});
   room.value = null;
   closeResultDialog();
+};
+
+const requestUndo = (): void => {
+  if (!room.value || !canRequestUndo.value) {
+    return;
+  }
+  errorMessage.value = "";
+  socket.send("game:undo_request", { roomCode: room.value.code });
+};
+
+const respondUndo = (accept: boolean): void => {
+  if (!room.value || !isUndoPending.value || isUndoRequesterMe.value) {
+    return;
+  }
+  errorMessage.value = "";
+  socket.send("game:undo_response", { roomCode: room.value.code, accept });
 };
 
 const createNewAiGame = (starterColor: StoneColor): PveGameState => ({
@@ -644,6 +704,39 @@ const bindSocketEvents = (): void => {
       if (typed.message) {
         notice.value = typed.message;
       }
+    }),
+  );
+
+  cleanupFns.push(
+    socket.on("game:undo_requested", () => {
+      notice.value = "已发送悔棋请求，等待对手确认";
+    }),
+  );
+
+  cleanupFns.push(
+    socket.on("game:undo_request_received", (payload) => {
+      const typed = payload as { requesterUsername?: string };
+      notice.value = typed.requesterUsername
+        ? `${typed.requesterUsername} 请求悔棋，请选择同意或拒绝`
+        : "对手请求悔棋，请选择同意或拒绝";
+    }),
+  );
+
+  cleanupFns.push(
+    socket.on("game:undo_applied", (payload) => {
+      const typed = payload as { requesterUsername?: string };
+      notice.value = typed.requesterUsername
+        ? `已悔棋，撤销了 ${typed.requesterUsername} 请求撤销的上一步`
+        : "已悔棋，棋盘已回退一步";
+    }),
+  );
+
+  cleanupFns.push(
+    socket.on("game:undo_rejected", (payload) => {
+      const typed = payload as { responderUsername?: string };
+      notice.value = typed.responderUsername
+        ? `${typed.responderUsername} 拒绝了悔棋请求`
+        : "对手拒绝了悔棋请求";
     }),
   );
 
@@ -980,6 +1073,23 @@ button.mini {
   opacity: 0.6;
 }
 
+.undo-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.undo-hint {
+  color: #4b5563;
+  font-size: 13px;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .tip {
   margin: 0;
   color: #555;
@@ -1103,6 +1213,10 @@ button.mini {
   .players span {
     font-size: 12px;
     padding: 4px 8px;
+  }
+
+  .undo-hint {
+    font-size: 12px;
   }
 
   .difficulty-options {
